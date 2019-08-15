@@ -17,16 +17,21 @@ import (
 /*
 #cgo LDFLAGS: -lcrypt
 #include <stdlib.h>
+#include <stdio.h>
 #include <unistd.h>
 #include <crypt.h>
 #include <shadow.h>
 #include <string.h>
+#include <pwd.h>
 */
 import "C"
 import (
+	"bufio"
+	"log"
 	"os/user"
 	"path/filepath"
 	"strconv"
+	"strings"
 )
 
 func Auth(user string, passwd string) bool {
@@ -36,7 +41,26 @@ func Auth(user string, passwd string) bool {
 	cpasswd := C.CString(passwd)
 	defer C.free(unsafe.Pointer(cpasswd))
 
-	pwd := C.getspnam(cuser)
+	cfilename := C.CString("/host/etc/shadow")
+	defer C.free(unsafe.Pointer(cfilename))
+
+	cmode := C.CString("r")
+	defer C.free(unsafe.Pointer(cmode))
+
+	f := C.fopen(cfilename, cmode)
+	defer C.fclose(f)
+
+	var pwd *C.struct_spwd
+	for {
+		if pwd = C.fgetspent(f); pwd == nil {
+			return false
+		}
+
+		if C.strcmp(cuser, pwd.sp_namp) == 0 {
+			break
+		}
+	}
+
 	if pwd == nil {
 		return false
 	}
@@ -50,27 +74,33 @@ func Auth(user string, passwd string) bool {
 	return true
 }
 
-/*func Auth(user, passwd string) error {
-		t, err := pam.StartFunc("system-auth", user, func(s pam.Style, msg string) (string, error) {
-			switch s {
-			case pam.PromptEchoOff:
-				return passwd, nil
-			case pam.PromptEchoOn, pam.ErrorMsg, pam.TextInfo:
-				return "", nil
-			}
-			return "", errors.New("Unrecognized PAM message style")
-		})
+func lookupUser(username string) *user.User {
+	file, err := os.Open("/host/etc/passwd")
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer file.Close()
 
-		if err != nil {
-			return err
+	scanner := bufio.NewScanner(file)
+
+	for scanner.Scan() {
+		parts := strings.Split(scanner.Text(), ":")
+
+		user := &user.User{
+			Uid:      parts[2],
+			Gid:      parts[3],
+			Username: parts[0],
+			Name:     parts[4],
+			HomeDir:  parts[5],
 		}
 
-		if err = t.Authenticate(0); err != nil {
-			return err
+		if user.Username == username {
+			return user
 		}
+	}
 
-		return nil
-}*/
+	return nil
+}
 
 type SSHServer struct {
 	sshd *sshserver.Server
@@ -135,7 +165,12 @@ func (s *SSHServer) sessionHandler(session sshserver.Session) {
 			logrus.Warn(err)
 		}
 	} else {
+		u := lookupUser(session.User())
+
 		cmd := exec.Command(session.Command()[0], session.Command()[1:]...)
+		cmd.Dir = u.HomeDir
+		cmd.SysProcAttr = &syscall.SysProcAttr{}
+		cmd.SysProcAttr.Chroot = "/host"
 
 		stdout, _ := cmd.StdoutPipe()
 		stdin, _ := cmd.StdinPipe()
@@ -173,7 +208,7 @@ func newShellCmd(username string, term string) *exec.Cmd {
 		term = "xterm"
 	}
 
-	u, _ := user.Lookup(username)
+	u := lookupUser(username)
 	uid, _ := strconv.Atoi(u.Uid)
 	gid, _ := strconv.Atoi(u.Gid)
 
@@ -185,6 +220,7 @@ func newShellCmd(username string, term string) *exec.Cmd {
 	}
 	cmd.Dir = u.HomeDir
 	cmd.SysProcAttr = &syscall.SysProcAttr{}
+	cmd.SysProcAttr.Chroot = "/host"
 	cmd.SysProcAttr.Credential = &syscall.Credential{Uid: uint32(uid), Gid: uint32(gid)}
 
 	return cmd

@@ -37,6 +37,8 @@ services:
     volumes:
       - ./agent:/go/src/github.com/gustavosbarreto/devicehub/agent
       - secrets:/var/run/secrets
+      - /:/host
+    privileged: true
     depends_on:
       - emq
       - api
